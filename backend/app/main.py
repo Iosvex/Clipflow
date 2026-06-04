@@ -27,6 +27,17 @@ app.mount("/clips", StaticFiles(directory=settings.CLIP_DIR), name="clips")
 # Create tables on startup
 Base.metadata.create_all(bind=engine)
 
+# ------------------------------------------------------------
+# HEALTH CHECK – keeps UptimeRobot happy
+# ------------------------------------------------------------
+@app.get("/")
+def root():
+    return {"status": "alive", "service": "ClipFlow"}
+
+
+# ------------------------------------------------------------
+# BACKGROUND PIPELINE (thread‑based, no Redis/worker)
+# ------------------------------------------------------------
 def run_pipeline(job_id: str, youtube_url: str):
     """Run the full pipeline in a background thread."""
     from .utils.db import SessionLocal
@@ -85,6 +96,9 @@ def run_pipeline(job_id: str, youtube_url: str):
         db.close()
 
 
+# ------------------------------------------------------------
+# API ROUTES
+# ------------------------------------------------------------
 @app.post("/api/jobs", response_model=JobResponse)
 def create_job(payload: JobCreate, db: Session = Depends(get_db)):
     job = Job(youtube_url=payload.youtube_url)
