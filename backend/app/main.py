@@ -28,9 +28,9 @@ app.mount("/clips", StaticFiles(directory=settings.CLIP_DIR), name="clips")
 Base.metadata.create_all(bind=engine)
 
 # ------------------------------------------------------------
-# HEALTH CHECK – keeps UptimeRobot happy
+# HEALTH CHECK – accepts both GET and HEAD (Render requirement)
 # ------------------------------------------------------------
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return {"status": "alive", "service": "ClipFlow"}
 
