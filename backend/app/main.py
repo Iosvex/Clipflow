@@ -6,13 +6,10 @@ try:
 
     app = FastAPI()
 
-    @app.get("/")
+    # Combined route for GET and HEAD – this will definitely respond to Render's health check
+    @app.api_route("/", methods=["GET", "HEAD"])
     def root():
         return {"status": "alive"}
-
-    @app.head("/")
-    def root_head():
-        return {}
 
     print("✅ APP CREATED SUCCESSFULLY", flush=True)
 
