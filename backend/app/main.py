@@ -1,3 +1,6 @@
+import os
+import threading
+import traceback
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
@@ -6,14 +9,10 @@ from .utils.db import get_db, engine, Base
 from .models import Job
 from .schemas import JobCreate, JobResponse
 from .config import settings
-from arq import create_pool
-from arq.connections import RedisSettings
-import os
-import urllib.parse
 
 app = FastAPI(title="ClipFlow API")
 
-# CORS for frontend (localhost dev)
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,32 +20,70 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount clip directory for serving finished videos
+# Serve finished clips
 os.makedirs(settings.CLIP_DIR, exist_ok=True)
 app.mount("/clips", StaticFiles(directory=settings.CLIP_DIR), name="clips")
 
 # Create tables on startup
 Base.metadata.create_all(bind=engine)
 
-@app.on_event("startup")
-async def startup():
-    redis_url = os.getenv("REDIS_URL")
-    if not redis_url:
-        raise Exception("REDIS_URL environment variable not set")
-    # Parse the redis/rediss URL into RedisSettings
-    parsed = urllib.parse.urlparse(redis_url)
-    settings_redis = RedisSettings(
-        host=parsed.hostname,
-        port=parsed.port or (6380 if parsed.scheme == "rediss" else 6379),
-        password=parsed.password,
-        ssl=parsed.scheme == "rediss",
-    )
-    app.state.redis = await create_pool(settings_redis)
+def run_pipeline(job_id: str, youtube_url: str):
+    """Run the full pipeline in a background thread."""
+    from .utils.db import SessionLocal
+    from .services.downloader import download_video
+    from .services.transcriber import transcribe
+    from .services.clip_selector import select_best_clip
+    from .services.trimmer import trim_and_crop
+    from .services.captioner import burn_captions
 
-@app.on_event("shutdown")
-async def shutdown():
-    if app.state.redis:
-        await app.state.redis.close()
+    db = SessionLocal()
+    try:
+        job = db.query(Job).filter(Job.id == job_id).first()
+        if not job:
+            return
+
+        # 1. Download
+        job.status = "downloading"
+        db.commit()
+        video_path, metadata = download_video(youtube_url, settings.DOWNLOAD_DIR)
+        job.video_path = str(video_path)
+
+        # 2. Transcribe
+        job.status = "transcribing"
+        db.commit()
+        words = transcribe(video_path)
+
+        # 3. Select best clip
+        job.status = "selecting"
+        db.commit()
+        start, end = select_best_clip(video_path, metadata, words)
+        job.start_time = start
+        job.end_time = end
+
+        # 4. Trim & crop
+        job.status = "trimming"
+        db.commit()
+        trimmed = trim_and_crop(video_path, start, end, settings.CLIP_DIR)
+
+        # 5. Burn captions
+        job.status = "captioning"
+        db.commit()
+        final_clip = burn_captions(trimmed, words, settings.CLIP_DIR)
+        job.clip_path = str(final_clip)
+
+        job.status = "done"
+        db.commit()
+
+    except Exception as e:
+        job = db.query(Job).filter(Job.id == job_id).first()
+        if job:
+            job.status = "error"
+            job.error = str(e)
+            db.commit()
+        traceback.print_exc()
+    finally:
+        db.close()
+
 
 @app.post("/api/jobs", response_model=JobResponse)
 def create_job(payload: JobCreate, db: Session = Depends(get_db)):
@@ -55,10 +92,12 @@ def create_job(payload: JobCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(job)
 
-    # TODO: Enqueue the actual pipeline job via the worker
-    # await app.state.redis.enqueue_job("process_job", job.id, job.youtube_url)
-    # For now, we just return the created job (status remains 'pending')
+    # Fire background thread (no Redis, no ARQ)
+    thread = threading.Thread(target=run_pipeline, args=(job.id, job.youtube_url))
+    thread.start()
+
     return job
+
 
 @app.get("/api/jobs/{job_id}", response_model=JobResponse)
 def get_job(job_id: str, db: Session = Depends(get_db)):
@@ -66,7 +105,7 @@ def get_job(job_id: str, db: Session = Depends(get_db)):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    response = JobResponse(
+    return JobResponse(
         id=job.id,
         youtube_url=job.youtube_url,
         status=job.status,
@@ -75,4 +114,3 @@ def get_job(job_id: str, db: Session = Depends(get_db)):
         clip_url=f"/clips/{os.path.basename(job.clip_path)}" if job.clip_path else None,
         error=job.error
     )
-    return response
