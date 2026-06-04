@@ -7,7 +7,6 @@ from .models import Job
 from .schemas import JobCreate, JobResponse
 from .config import settings
 from arq import create_pool
-from arq.connections import RedisSettings
 import os
 
 app = FastAPI(title="ClipFlow API")
@@ -29,7 +28,10 @@ Base.metadata.create_all(bind=engine)
 
 @app.on_event("startup")
 async def startup():
-    app.state.redis = await create_pool(RedisSettings(host="localhost", port=6379))
+    redis_url = os.getenv("REDIS_URL")
+    if not redis_url:
+        raise Exception("REDIS_URL environment variable not set")
+    app.state.redis = await create_pool(redis_url)
 
 @app.on_event("shutdown")
 async def shutdown():
