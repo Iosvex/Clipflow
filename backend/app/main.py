@@ -7,7 +7,9 @@ from .models import Job
 from .schemas import JobCreate, JobResponse
 from .config import settings
 from arq import create_pool
+from arq.connections import RedisSettings
 import os
+import urllib.parse
 
 app = FastAPI(title="ClipFlow API")
 
@@ -31,7 +33,15 @@ async def startup():
     redis_url = os.getenv("REDIS_URL")
     if not redis_url:
         raise Exception("REDIS_URL environment variable not set")
-    app.state.redis = await create_pool(redis_url)
+    # Parse the redis/rediss URL into RedisSettings
+    parsed = urllib.parse.urlparse(redis_url)
+    settings_redis = RedisSettings(
+        host=parsed.hostname,
+        port=parsed.port or (6380 if parsed.scheme == "rediss" else 6379),
+        password=parsed.password,
+        ssl=parsed.scheme == "rediss",
+    )
+    app.state.redis = await create_pool(settings_redis)
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -45,10 +55,9 @@ def create_job(payload: JobCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(job)
 
-    # Enqueue background task (requires running ARQ worker)
-    # For now, we'll just simulate; real enqueue would be:
+    # TODO: Enqueue the actual pipeline job via the worker
     # await app.state.redis.enqueue_job("process_job", job.id, job.youtube_url)
-    # Since we don't have a worker yet, we skip actual processing
+    # For now, we just return the created job (status remains 'pending')
     return job
 
 @app.get("/api/jobs/{job_id}", response_model=JobResponse)
