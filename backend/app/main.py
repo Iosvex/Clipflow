@@ -28,7 +28,7 @@ app.mount("/clips", StaticFiles(directory=settings.CLIP_DIR), name="clips")
 Base.metadata.create_all(bind=engine)
 
 # ------------------------------------------------------------
-# HEALTH CHECK – accepts both GET and HEAD (Render requirement)
+# HEALTH CHECK – accepts both GET and HEAD (required by Render)
 # ------------------------------------------------------------
 @app.api_route("/", methods=["GET", "HEAD"])
 def root():
@@ -106,7 +106,7 @@ def create_job(payload: JobCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(job)
 
-    # Fire background thread (no Redis, no ARQ)
+    # Fire background thread
     thread = threading.Thread(target=run_pipeline, args=(job.id, job.youtube_url))
     thread.start()
 
