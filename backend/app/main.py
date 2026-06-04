@@ -1,9 +1,10 @@
 import os
 import threading
 import traceback
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from .utils.db import get_db, engine, Base
 from .models import Job
@@ -11,6 +12,17 @@ from .schemas import JobCreate, JobResponse
 from .config import settings
 
 app = FastAPI(title="ClipFlow API")
+
+# ------------------------------------------------------------
+# MIDDLEWARE – catch all HEAD requests and return 200 (for Render health check)
+# ------------------------------------------------------------
+@app.middleware("http")
+async def catch_head_requests(request: Request, call_next):
+    if request.method == "HEAD":
+        # Return a minimal 200 response so Render sees the service as healthy
+        return JSONResponse(content={}, status_code=200)
+    response = await call_next(request)
+    return response
 
 # CORS
 app.add_middleware(
@@ -27,9 +39,7 @@ app.mount("/clips", StaticFiles(directory=settings.CLIP_DIR), name="clips")
 # Create tables on startup
 Base.metadata.create_all(bind=engine)
 
-# ------------------------------------------------------------
-# HEALTH CHECK – accepts both GET and HEAD (required by Render)
-# ------------------------------------------------------------
+# (Optional) keep the root route for GET requests
 @app.api_route("/", methods=["GET", "HEAD"])
 def root():
     return {"status": "alive", "service": "ClipFlow"}
@@ -39,7 +49,7 @@ def root():
 # BACKGROUND PIPELINE (thread‑based, no Redis/worker)
 # ------------------------------------------------------------
 def run_pipeline(job_id: str, youtube_url: str):
-    """Run the full pipeline in a background thread."""
+    # … (your existing pipeline code – unchanged)
     from .utils.db import SessionLocal
     from .services.downloader import download_video
     from .services.transcriber import transcribe
