@@ -5,239 +5,153 @@ import uuid
 import threading
 import traceback
 import shutil
-import re
+import requests
 from pathlib import Path
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
+from .utils.db import get_db, engine, Base
+from .models import Job
+from .schemas import JobCreate, JobResponse
+from .config import settings
 
-try:
-    from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
-    from fastapi.staticfiles import StaticFiles
-    from fastapi.middleware.cors import CORSMiddleware
-    from sqlalchemy.orm import Session
-    from .utils.db import get_db, engine, Base
-    from .models import Job
-    from .schemas import JobCreate, JobResponse
-    from .config import settings
-    print("✅ ALL IMPORTS SUCCESSFUL", flush=True)
+app = FastAPI(title="ClipFlow API")
 
-    app = FastAPI(title="ClipFlow API")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+os.makedirs(settings.CLIP_DIR, exist_ok=True)
+app.mount("/clips", StaticFiles(directory=settings.CLIP_DIR), name="clips")
+Base.metadata.create_all(bind=engine)
 
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+# ---------- HEALTH CHECK ----------
+@app.api_route("/", methods=["GET", "HEAD"])
+def root():
+    return {"status": "alive"}
 
-    os.makedirs(settings.CLIP_DIR, exist_ok=True)
-    app.mount("/clips", StaticFiles(directory=settings.CLIP_DIR), name="clips")
-    Base.metadata.create_all(bind=engine)
+# ---------- Hugging Face Space URL ----------
+HF_SPACE_URL = os.getenv("HF_SPACE_URL", "https://vexcukt-clipflow-processor.hf.space")
+PROCESS_ENDPOINT = f"{HF_SPACE_URL}/api/predict"
 
-    # ---------- HEALTH CHECK ----------
-    @app.api_route("/", methods=["GET", "HEAD"])
-    def root():
-        return {"status": "alive"}
-
-    # ---------- SRT PARSER (unchanged) ----------
-    def parse_srt(srt_text: str) -> list:
-        words = []
-        blocks = re.split(r'\n\s*\n', srt_text.strip())
-        for block in blocks:
-            lines = block.strip().splitlines()
-            if len(lines) < 3:
-                continue
-            time_match = re.search(r'(\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2},\d{3})', lines[1])
-            if not time_match:
-                continue
-            start_str, end_str = time_match.groups()
-            start = _srt_time_to_seconds(start_str)
-            end = _srt_time_to_seconds(end_str)
-            text = " ".join(lines[2:])
-            word_list = text.split()
-            if not word_list:
-                continue
-            word_duration = (end - start) / len(word_list)
-            for i, w in enumerate(word_list):
-                word_start = start + i * word_duration
-                word_end = word_start + word_duration
-                words.append({
-                    "word": w,
-                    "start": word_start,
-                    "end": word_end,
-                    "score": 0.9
-                })
-        return words
-
-    def _srt_time_to_seconds(srt_time: str) -> float:
-        h, m, s_ms = srt_time.split(":")
-        s, ms = s_ms.split(",")
-        return int(h)*3600 + int(m)*60 + int(s) + int(ms)/1000
-
-    # ---------- PIPELINE FOR YOUTUBE URL (no captions) ----------
-    def run_pipeline(job_id: str, youtube_url: str):
-        from .utils.db import SessionLocal
-        from .services.downloader import fetch_transcript, download_video
-        from .services.transcriber import transcribe
-        from .services.clip_selector import select_best_clip
-        from .services.trimmer import trim_and_crop
-
-        db = SessionLocal()
-        try:
-            job = db.query(Job).filter(Job.id == job_id).first()
-            if not job:
-                return
-
-            # 1. Get transcript (fast)
-            job.status = "fetching transcript"
-            db.commit()
-            srt = fetch_transcript(youtube_url)
-
-            if srt:
-                words = parse_srt(srt)
-                metadata = {"duration": 0, "heatmap": None}
-                start, end = select_best_clip(None, metadata, words)
-            else:
-                # Fallback: full download + transcribe
-                job.status = "downloading full video"
-                db.commit()
-                video_path, metadata = download_video(youtube_url)
-                words = transcribe(video_path)
-                start, end = select_best_clip(video_path, metadata, words)
-
-            job.start_time = start
-            job.end_time = end
-
-            # 2. Download only the best segment
-            job.status = "downloading clip"
-            db.commit()
-            video_path, _ = download_video(youtube_url, settings.DOWNLOAD_DIR,
-                                           start=start, end=end)
-
-            # 3. Trim & crop to 9:16 – FINAL OUTPUT
-            job.status = "trimming"
-            db.commit()
-            trimmed = trim_and_crop(video_path, start, end, settings.CLIP_DIR)
-            job.clip_path = str(trimmed)
-
-            job.status = "done"
-            db.commit()
-
-        except Exception as e:
-            db.rollback()
-            try:
-                job = db.query(Job).filter(Job.id == job_id).first()
-                if job:
-                    job.status = "error"
-                    job.error = str(e)
-                    db.commit()
-            except:
-                pass
-            traceback.print_exc()
-        finally:
-            db.close()
-
-    # ---------- PIPELINE FOR UPLOADED FILE (no captions) ----------
-    def run_pipeline_with_file(job_id: str, file_path: str):
-        from .utils.db import SessionLocal
-        from .services.transcriber import transcribe
-        from .services.clip_selector import select_best_clip
-        from .services.trimmer import trim_and_crop
-
-        db = SessionLocal()
-        try:
-            job = db.query(Job).filter(Job.id == job_id).first()
-            if not job:
-                return
-            video_path = Path(file_path)
-
-            job.status = "transcribing"
-            db.commit()
-            words = transcribe(video_path)
-
-            metadata = {"duration": 0, "heatmap": None}
-
-            job.status = "selecting"
-            db.commit()
-            start, end = select_best_clip(video_path, metadata, words)
-            job.start_time = start
-            job.end_time = end
-
-            job.status = "trimming"
-            db.commit()
-            trimmed = trim_and_crop(video_path, start, end, settings.CLIP_DIR)
-            job.clip_path = str(trimmed)
-
-            job.status = "done"
-            db.commit()
-
-        except Exception as e:
-            db.rollback()
-            try:
-                job = db.query(Job).filter(Job.id == job_id).first()
-                if job:
-                    job.status = "error"
-                    job.error = str(e)
-                    db.commit()
-            except:
-                pass
-            traceback.print_exc()
-        finally:
-            db.close()
-            try:
-                os.unlink(file_path)
-            except:
-                pass
-
-    # ---------- YOUTUBE URL ENDPOINT ----------
-    @app.post("/api/jobs", response_model=JobResponse)
-    def create_job_from_url(payload: JobCreate, db: Session = Depends(get_db)):
-        job = Job(youtube_url=payload.youtube_url)
-        db.add(job)
-        db.commit()
-        db.refresh(job)
-
-        thread = threading.Thread(target=run_pipeline, args=(job.id, job.youtube_url))
-        thread.start()
-        return job
-
-    # ---------- FILE UPLOAD ENDPOINT ----------
-    @app.post("/api/jobs/upload", response_model=JobResponse)
-    async def create_job_from_upload(file: UploadFile = File(...), db: Session = Depends(get_db)):
-        upload_dir = "/tmp/clipflow_uploads"
-        os.makedirs(upload_dir, exist_ok=True)
-        file_ext = Path(file.filename).suffix
-        local_filename = f"{uuid.uuid4().hex}{file_ext}"
-        file_path = os.path.join(upload_dir, local_filename)
-
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-
-        job = Job(youtube_url=f"upload:{file.filename}")
-        db.add(job)
-        db.commit()
-        db.refresh(job)
-
-        thread = threading.Thread(target=run_pipeline_with_file, args=(job.id, file_path))
-        thread.start()
-        return job
-
-    # ---------- JOB STATUS ----------
-    @app.get("/api/jobs/{job_id}", response_model=JobResponse)
-    def get_job(job_id: str, db: Session = Depends(get_db)):
+# ---------- PROCESSING FUNCTION (sends video to Space) ----------
+def process_via_space(job_id: str, video_path: str):
+    from .utils.db import SessionLocal
+    db = SessionLocal()
+    try:
         job = db.query(Job).filter(Job.id == job_id).first()
         if not job:
-            raise HTTPException(status_code=404, detail="Job not found")
-        return JobResponse(
-            id=job.id,
-            youtube_url=job.youtube_url,
-            status=job.status,
-            start_time=job.start_time,
-            end_time=job.end_time,
-            clip_url=f"/clips/{os.path.basename(job.clip_path)}" if job.clip_path else None,
-            error=job.error,
-        )
+            return
+        job.status = "processing"
+        db.commit()
 
-    print("✅ APP FULLY READY", flush=True)
+        # Send video to Space (Gradio API expects a file in the request)
+        with open(video_path, "rb") as f:
+            files = {"file": f}
+            response = requests.post(PROCESS_ENDPOINT, files=files, timeout=600)
 
-except Exception as e:
-    print(f"❌ STARTUP ERROR: {e}", flush=True)
-    raise
+        if response.status_code != 200:
+            raise Exception(f"Space API returned {response.status_code}: {response.text}")
+
+        result = response.json()
+        # Gradio returns a list with the output file path in data[0]
+        if "data" not in result or not result["data"]:
+            raise Exception("Empty response from Space")
+        processed_file_url = result["data"][0]
+
+        # Download the finished clip to our clips directory
+        clip_name = f"clip_{uuid.uuid4().hex}.mp4"
+        clip_path = os.path.join(settings.CLIP_DIR, clip_name)
+        with requests.get(processed_file_url, stream=True) as r:
+            r.raise_for_status()
+            with open(clip_path, "wb") as out_file:
+                for chunk in r.iter_content(chunk_size=8192):
+                    out_file.write(chunk)
+
+        job.clip_path = clip_path
+        job.status = "done"
+        db.commit()
+
+    except Exception as e:
+        db.rollback()
+        try:
+            job = db.query(Job).filter(Job.id == job_id).first()
+            if job:
+                job.status = "error"
+                job.error = str(e)
+                db.commit()
+        except:
+            pass
+        traceback.print_exc()
+    finally:
+        db.close()
+        try:
+            os.unlink(video_path)
+        except:
+            pass
+
+# ---------- UPLOAD ENDPOINT ----------
+@app.post("/api/jobs/upload", response_model=JobResponse)
+async def create_job_from_upload(file: UploadFile = File(...), db: Session = Depends(get_db)):
+    upload_dir = "/tmp/clipflow_uploads"
+    os.makedirs(upload_dir, exist_ok=True)
+    file_ext = Path(file.filename).suffix
+    local_filename = f"{uuid.uuid4().hex}{file_ext}"
+    file_path = os.path.join(upload_dir, local_filename)
+
+    with open(file_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+
+    job = Job(youtube_url=f"upload:{file.filename}")
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+
+    thread = threading.Thread(target=process_via_space, args=(job.id, file_path))
+    thread.start()
+    return job
+
+# ---------- YOUTUBE URL ENDPOINT (optional – keep if you still want it) ----------
+@app.post("/api/jobs", response_model=JobResponse)
+def create_job_from_url(payload: JobCreate, db: Session = Depends(get_db)):
+    from .services.downloader import download_video
+    job = Job(youtube_url=payload.youtube_url)
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+
+    def dl_and_process():
+        try:
+            video_path, _ = download_video(payload.youtube_url)
+            process_via_space(job.id, str(video_path))
+        except Exception as e:
+            # Update job error if download fails
+            session = SessionLocal()
+            try:
+                j = session.query(Job).filter(Job.id == job.id).first()
+                if j:
+                    j.status = "error"
+                    j.error = str(e)
+                    session.commit()
+            finally:
+                session.close()
+
+    thread = threading.Thread(target=dl_and_process)
+    thread.start()
+    return job
+
+# ---------- JOB STATUS ----------
+@app.get("/api/jobs/{job_id}", response_model=JobResponse)
+def get_job(job_id: str, db: Session = Depends(get_db)):
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return JobResponse(
+        id=job.id,
+        youtube_url=job.youtube_url,
+        status=job.status,
+        start_time=job.start_time,
+        end_time=job.end_time,
+        clip_url=f"/clips/{os.path.basename(job.clip_path)}" if job.clip_path else None,
+        error=job.error,
+    )
+
+print("✅ APP FULLY READY", flush=True)
