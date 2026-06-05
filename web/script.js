@@ -1,26 +1,54 @@
+const API_BASE = 'https://clipflow-api-wd6b.onrender.com/api';
+
 const form = document.getElementById('clipForm');
-const input = document.getElementById('youtubeUrl');
+const fileInput = document.getElementById('videoFile');
 const submitBtn = document.getElementById('submitBtn');
 const jobsContainer = document.getElementById('jobsContainer');
 const jobs = [];
 
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
-  const url = input.value.trim();
-  if (!url) return;
-  const jobId = crypto.randomUUID();
-  const job = { id: jobId, url, status: 'pending' };
+  const file = fileInput.files[0];
+  if (!file) return;
+
+  const localJobId = crypto.randomUUID();
+  const job = { id: localJobId, fileName: file.name, status: 'pending' };
   jobs.push(job);
   renderJobs();
-  input.value = '';
+  fileInput.value = '';
   submitBtn.disabled = true;
   submitBtn.textContent = '⏳';
+
   try {
-    updateJobStatus(jobId, 'processing');
-    await delay(3000);
-    updateJobStatus(jobId, 'done', { videoUrl: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4' });
+    const formData = new FormData();
+    formData.append('video', file);
+
+    const createRes = await fetch(`${API_BASE}/jobs/upload`, {
+      method: 'POST',
+      body: formData
+    });
+    if (!createRes.ok) throw new Error('Failed to create job');
+    const { id: backendJobId } = await createRes.json();
+
+    let done = false;
+    updateJobStatus(localJobId, 'processing');
+    while (!done) {
+      await delay(3000);
+      const statusRes = await fetch(`${API_BASE}/jobs/${backendJobId}`);
+      if (!statusRes.ok) continue;
+      const jobData = await statusRes.json();
+      if (jobData.status === 'done') {
+        updateJobStatus(localJobId, 'done', {
+          videoUrl: `https://clipflow-api-wd6b.onrender.com${jobData.clip_url}`
+        });
+        done = true;
+      } else if (jobData.status === 'error') {
+        updateJobStatus(localJobId, 'error', { error: jobData.error });
+        done = true;
+      }
+    }
   } catch (err) {
-    updateJobStatus(jobId, 'error', { error: 'Something went wrong' });
+    updateJobStatus(localJobId, 'error', { error: err.message });
   } finally {
     submitBtn.disabled = false;
     submitBtn.textContent = '🔥 Clip It';
@@ -40,7 +68,7 @@ function renderJobs() {
   jobsContainer.innerHTML = jobs.map(job => `
     <div class="job-card">
       <div class="job-header">
-        <span class="job-url">${escapeHtml(job.url)}</span>
+        <span class="job-url">${escapeHtml(job.fileName || job.url)}</span>
         <span class="status ${job.status}">${statusEmoji(job.status)} ${job.status}</span>
       </div>
       ${job.status === 'processing' ? '<div class="progress-bar"><div class="fill"></div></div>' : ''}

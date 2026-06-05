@@ -1,11 +1,14 @@
 print("✅✅✅ HELLO FROM PYTHON", flush=True)
 
 import os
+import uuid
 import threading
 import traceback
+import shutil
+from pathlib import Path
 
 try:
-    from fastapi import FastAPI, Depends, HTTPException
+    from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
     from fastapi.staticfiles import StaticFiles
     from fastapi.middleware.cors import CORSMiddleware
     from sqlalchemy.orm import Session
@@ -24,10 +27,8 @@ try:
         allow_headers=["*"],
     )
 
-    # Serve finished clips
     os.makedirs(settings.CLIP_DIR, exist_ok=True)
     app.mount("/clips", StaticFiles(directory=settings.CLIP_DIR), name="clips")
-
     Base.metadata.create_all(bind=engine)
 
     # ---------- HEALTH CHECK ----------
@@ -35,24 +36,9 @@ try:
     def root():
         return {"status": "alive"}
 
-    # ---------- OPTIONAL TEST ENDPOINT (yt‑dlp) ----------
-    @app.get("/test-ytdlp")
-    def test_ytdlp():
-        try:
-            import yt_dlp
-            with yt_dlp.YoutubeDL() as ydl:
-                info = ydl.extract_info(
-                    "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-                    download=False
-                )
-            return {"title": info["title"]}
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
-
-    # ---------- PIPELINE ----------
-    def run_pipeline(job_id: str, youtube_url: str):
+    # ---------- PIPELINE FOR UPLOADED FILE ----------
+    def run_pipeline_with_file(job_id: str, file_path: str):
         from .utils.db import SessionLocal
-        from .services.downloader import download_video
         from .services.transcriber import transcribe
         from .services.clip_selector import select_best_clip
         from .services.trimmer import trim_and_crop
@@ -63,15 +49,13 @@ try:
             job = db.query(Job).filter(Job.id == job_id).first()
             if not job:
                 return
-
-            job.status = "downloading"
-            db.commit()
-            video_path, metadata = download_video(youtube_url, settings.DOWNLOAD_DIR)
-            job.video_path = str(video_path)
+            video_path = Path(file_path)
 
             job.status = "transcribing"
             db.commit()
             words = transcribe(video_path)
+
+            metadata = {"duration": 0, "heatmap": None}
 
             job.status = "selecting"
             db.commit()
@@ -104,25 +88,38 @@ try:
             traceback.print_exc()
         finally:
             db.close()
+            try:
+                os.unlink(file_path)
+            except:
+                pass
 
-    # ---------- ROUTES ----------
-    @app.post("/api/jobs", response_model=JobResponse)
-    def create_job(payload: JobCreate, db: Session = Depends(get_db)):
-        job = Job(youtube_url=payload.youtube_url)
+    # ---------- UPLOAD ENDPOINT ----------
+    @app.post("/api/jobs/upload", response_model=JobResponse)
+    async def create_job_from_upload(file: UploadFile = File(...), db: Session = Depends(get_db)):
+        upload_dir = "/tmp/clipflow_uploads"
+        os.makedirs(upload_dir, exist_ok=True)
+        file_ext = Path(file.filename).suffix
+        local_filename = f"{uuid.uuid4().hex}{file_ext}"
+        file_path = os.path.join(upload_dir, local_filename)
+
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        job = Job(youtube_url=f"upload:{file.filename}")
         db.add(job)
         db.commit()
         db.refresh(job)
 
-        thread = threading.Thread(target=run_pipeline, args=(job.id, job.youtube_url))
+        thread = threading.Thread(target=run_pipeline_with_file, args=(job.id, file_path))
         thread.start()
         return job
 
+    # ---------- JOB STATUS ----------
     @app.get("/api/jobs/{job_id}", response_model=JobResponse)
     def get_job(job_id: str, db: Session = Depends(get_db)):
         job = db.query(Job).filter(Job.id == job_id).first()
         if not job:
             raise HTTPException(status_code=404, detail="Job not found")
-
         return JobResponse(
             id=job.id,
             youtube_url=job.youtube_url,

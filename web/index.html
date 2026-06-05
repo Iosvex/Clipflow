@@ -3,17 +3,19 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>ClipFlow – YouTube to Shorts</title>
+  <title>ClipFlow – Video Clipper</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <main>
     <h1>🎬 ClipFlow</h1>
-    <p>YouTube → clipped, captioned, ready to post</p>
-    <form id="clipForm">
-      <input type="url" id="youtubeUrl" placeholder="Paste YouTube link here..." required>
+    <p>Upload a video, AI finds the best part & adds captions</p>
+
+    <form id="clipForm" enctype="multipart/form-data">
+      <input type="file" id="videoFile" accept="video/*" required>
       <button type="submit" id="submitBtn">🔥 Clip It</button>
     </form>
+
     <div id="jobsContainer"></div>
   </main>
   <script src="script.js"></script>
