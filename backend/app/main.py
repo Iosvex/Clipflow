@@ -52,15 +52,20 @@ def process_via_space(job_id: str, video_path: str):
             raise Exception(f"Space API returned {response.status_code}: {response.text}")
 
         result = response.json()
-        # Gradio returns a list with the output file path in data[0]
         if "data" not in result or not result["data"]:
             raise Exception("Empty response from Space")
-        processed_file_url = result["data"][0]
+
+        # The Space returns a relative path or full URL for the output file
+        file_ref = result["data"][0]
+        if file_ref.startswith("http"):
+            download_url = file_ref
+        else:
+            download_url = f"{HF_SPACE_URL.rstrip('/')}{file_ref}"
 
         # Download the finished clip to our clips directory
         clip_name = f"clip_{uuid.uuid4().hex}.mp4"
         clip_path = os.path.join(settings.CLIP_DIR, clip_name)
-        with requests.get(processed_file_url, stream=True) as r:
+        with requests.get(download_url, stream=True) as r:
             r.raise_for_status()
             with open(clip_path, "wb") as out_file:
                 for chunk in r.iter_content(chunk_size=8192):
@@ -123,7 +128,6 @@ def create_job_from_url(payload: JobCreate, db: Session = Depends(get_db)):
             video_path, _ = download_video(payload.youtube_url)
             process_via_space(job.id, str(video_path))
         except Exception as e:
-            # Update job error if download fails
             session = SessionLocal()
             try:
                 j = session.query(Job).filter(Job.id == job.id).first()
