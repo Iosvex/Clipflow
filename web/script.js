@@ -21,7 +21,7 @@ form.addEventListener('submit', async (e) => {
 
   try {
     const formData = new FormData();
-    formData.append('video', file);
+    formData.append('file', file);
 
     const createRes = await fetch(`${API_BASE}/jobs/upload`, {
       method: 'POST',
