@@ -5,7 +5,6 @@ import uuid
 import threading
 import traceback
 import shutil
-import requests
 from pathlib import Path
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
 from fastapi.staticfiles import StaticFiles
@@ -15,6 +14,8 @@ from .utils.db import get_db, engine, Base
 from .models import Job
 from .schemas import JobCreate, JobResponse
 from .config import settings
+
+from gradio_client import Client, handle_file
 
 app = FastAPI(title="ClipFlow API")
 
@@ -28,11 +29,9 @@ Base.metadata.create_all(bind=engine)
 def root():
     return {"status": "alive"}
 
-# ---------- Hugging Face Space URL ----------
-HF_SPACE_URL = os.getenv("HF_SPACE_URL", "https://vexcukt-clipflow-processor.hf.space")
-PROCESS_ENDPOINT = f"{HF_SPACE_URL}/api/predict"
+# ---------- Hugging Face Space connection ----------
+SPACE_NAME = os.getenv("SPACE_NAME", "vexcukt/clipflow-processor")
 
-# ---------- PROCESSING FUNCTION (sends video to Space) ----------
 def process_via_space(job_id: str, video_path: str):
     from .utils.db import SessionLocal
     db = SessionLocal()
@@ -43,33 +42,25 @@ def process_via_space(job_id: str, video_path: str):
         job.status = "processing"
         db.commit()
 
-        # Send video to Space (Gradio API expects a file in the request)
-        with open(video_path, "rb") as f:
-            files = {"file": f}
-            response = requests.post(PROCESS_ENDPOINT, files=files, timeout=600)
+        # Connect to the Space using the Gradio client
+        client = Client(SPACE_NAME)
 
-        if response.status_code != 200:
-            raise Exception(f"Space API returned {response.status_code}: {response.text}")
+        # Call the process_video function on the Space
+        # handle_file() marks the local path as a file input
+        result = client.predict(
+            video_file=handle_file(video_path),
+            api_name="/process_video"
+        )
 
-        result = response.json()
-        if "data" not in result or not result["data"]:
-            raise Exception("Empty response from Space")
+        # The result is the path to the processed file (already downloaded by the client)
+        # result is a string path to the local downloaded file
+        if not result or not os.path.exists(result):
+            raise Exception("Space did not return a valid file")
 
-        # The Space returns a relative path or full URL for the output file
-        file_ref = result["data"][0]
-        if file_ref.startswith("http"):
-            download_url = file_ref
-        else:
-            download_url = f"{HF_SPACE_URL.rstrip('/')}{file_ref}"
-
-        # Download the finished clip to our clips directory
+        # Move/copy to our clips directory
         clip_name = f"clip_{uuid.uuid4().hex}.mp4"
         clip_path = os.path.join(settings.CLIP_DIR, clip_name)
-        with requests.get(download_url, stream=True) as r:
-            r.raise_for_status()
-            with open(clip_path, "wb") as out_file:
-                for chunk in r.iter_content(chunk_size=8192):
-                    out_file.write(chunk)
+        shutil.move(result, clip_path)
 
         job.clip_path = clip_path
         job.status = "done"
@@ -114,7 +105,7 @@ async def create_job_from_upload(file: UploadFile = File(...), db: Session = Dep
     thread.start()
     return job
 
-# ---------- YOUTUBE URL ENDPOINT (optional – keep if you still want it) ----------
+# ---------- YOUTUBE URL ENDPOINT ----------
 @app.post("/api/jobs", response_model=JobResponse)
 def create_job_from_url(payload: JobCreate, db: Session = Depends(get_db)):
     from .services.downloader import download_video
