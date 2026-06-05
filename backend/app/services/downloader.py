@@ -28,14 +28,18 @@ def download_video(url: str, output_dir: Optional[str] = None) -> Tuple[Path, di
 
     cmd = [
         "yt-dlp",
-        "-f", "bestvideo[height<=720]+bestaudio/best[height<=720]",
+        # Force Android client to avoid web bot challenge
+        "--extractor-args", "youtube:player_client=android",
+        # Fallback format that doesn't require JS challenge solving
+        "-f", "best[height<=720][ext=mp4]/best[height<=720]",
         "--merge-output-format", "mp4",
         "--print-json",
         "--no-playlist",
-        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+        "--user-agent", "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36",
         "--sleep-interval", "3",
         "--max-sleep-interval", "15",
-        "--js-runtimes", "deno",    # <-- uses the Deno binary we installed
+        # Explicit full path to deno binary
+        "--js-runtimes", "/opt/render/.deno/bin/deno",
         "-o", output_template,
     ]
 
@@ -46,7 +50,6 @@ def download_video(url: str, output_dir: Optional[str] = None) -> Tuple[Path, di
 
     process = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
 
-    # Clean up temp cookie file
     if cookie_path:
         os.unlink(cookie_path)
 
