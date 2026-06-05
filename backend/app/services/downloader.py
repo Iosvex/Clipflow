@@ -1,12 +1,9 @@
-"""
-Downloads a YouTube video + metadata using yt-dlp.
-Returns the video file path and parsed heatmap data.
-"""
-
 import subprocess
 import json
 import os
 import uuid
+import base64
+import tempfile
 from pathlib import Path
 from typing import Optional, Tuple
 from ..config import settings
@@ -15,6 +12,16 @@ def download_video(url: str, output_dir: Optional[str] = None) -> Tuple[Path, di
     if output_dir is None:
         output_dir = settings.DOWNLOAD_DIR
     os.makedirs(output_dir, exist_ok=True)
+
+    # Decode cookies from environment variable
+    cookies_b64 = os.getenv("YOUTUBE_COOKIES_BASE64", "")
+    cookie_path = None
+    if cookies_b64:
+        cookie_data = base64.b64decode(cookies_b64).decode("utf-8")
+        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False)
+        tmp.write(cookie_data)
+        tmp.close()
+        cookie_path = tmp.name
 
     job_id = uuid.uuid4().hex[:10]
     output_template = str(Path(output_dir) / f"{job_id}_%(title)s.%(ext)s")
@@ -28,11 +35,21 @@ def download_video(url: str, output_dir: Optional[str] = None) -> Tuple[Path, di
         "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
         "--sleep-interval", "3",
         "--max-sleep-interval", "15",
+        "--js-runtimes", "deno",    # <-- uses the Deno binary we installed
         "-o", output_template,
-        url
     ]
 
+    if cookie_path:
+        cmd += ["--cookies", cookie_path]
+
+    cmd.append(url)
+
     process = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+
+    # Clean up temp cookie file
+    if cookie_path:
+        os.unlink(cookie_path)
+
     if process.returncode != 0:
         raise RuntimeError(f"yt-dlp failed: {process.stderr}")
 
