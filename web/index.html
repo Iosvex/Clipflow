@@ -3,21 +3,42 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>ClipFlow – Video Clipper</title>
+  <title>ClipFlow – AI Video Clipper</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <main>
-    <h1>🎬 ClipFlow</h1>
-    <p>Upload a video, AI finds the best part & adds captions</p>
+  <div class="container">
+    <header>
+      <h1>🎬 ClipFlow</h1>
+      <p class="subtitle">YouTube or upload → AI finds the best moment & crops to vertical</p>
+    </header>
 
-    <form id="clipForm" enctype="multipart/form-data">
-      <input type="file" id="videoFile" accept="video/*" required>
-      <button type="submit" id="submitBtn">🔥 Clip It</button>
-    </form>
+    <!-- Tab switcher -->
+    <div class="tabs">
+      <button class="tab active" data-tab="url">🔗 YouTube Link</button>
+      <button class="tab" data-tab="upload">📁 Upload Video</button>
+    </div>
 
+    <!-- Tab content -->
+    <div class="tab-content active" id="url-tab">
+      <form id="urlForm">
+        <input type="url" id="youtubeUrl" placeholder="Paste YouTube link here..." required>
+        <button type="submit" id="urlSubmitBtn">🔥 Clip It</button>
+      </form>
+    </div>
+
+    <div class="tab-content" id="upload-tab">
+      <form id="uploadForm" enctype="multipart/form-data">
+        <label for="videoFile" class="file-label">Choose a video file</label>
+        <input type="file" id="videoFile" accept="video/*" required>
+        <button type="submit" id="uploadSubmitBtn">🔥 Clip It</button>
+      </form>
+    </div>
+
+    <!-- Jobs list -->
     <div id="jobsContainer"></div>
-  </main>
+  </div>
+
   <script src="script.js"></script>
 </body>
 </html>
