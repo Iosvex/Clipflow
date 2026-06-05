@@ -7,7 +7,6 @@ import traceback
 import shutil
 import re
 from pathlib import Path
-from datetime import timedelta
 
 try:
     from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
@@ -38,29 +37,21 @@ try:
     def root():
         return {"status": "alive"}
 
-    # ---------- SRT PARSER ----------
+    # ---------- SRT PARSER (unchanged) ----------
     def parse_srt(srt_text: str) -> list:
-        """
-        Convert SRT content to a list of word dicts (like transcriber output).
-        We'll approximate word‑level timestamps by spreading words across the subtitle block.
-        """
         words = []
-        # Split into blocks (each block: index, timestamp line, text lines)
         blocks = re.split(r'\n\s*\n', srt_text.strip())
         for block in blocks:
             lines = block.strip().splitlines()
             if len(lines) < 3:
                 continue
-            # Second line should be the timestamp "00:00:01,000 --> 00:00:04,000"
             time_match = re.search(r'(\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2},\d{3})', lines[1])
             if not time_match:
                 continue
             start_str, end_str = time_match.groups()
             start = _srt_time_to_seconds(start_str)
             end = _srt_time_to_seconds(end_str)
-            # Text lines (could be multiple)
             text = " ".join(lines[2:])
-            # Split text into words and distribute them evenly across the time span
             word_list = text.split()
             if not word_list:
                 continue
@@ -77,19 +68,17 @@ try:
         return words
 
     def _srt_time_to_seconds(srt_time: str) -> float:
-        """Convert '00:00:01,234' -> 1.234 seconds"""
         h, m, s_ms = srt_time.split(":")
         s, ms = s_ms.split(",")
         return int(h)*3600 + int(m)*60 + int(s) + int(ms)/1000
 
-    # ---------- PIPELINE FOR YOUTUBE URL (transcript first) ----------
+    # ---------- PIPELINE FOR YOUTUBE URL (no captions) ----------
     def run_pipeline(job_id: str, youtube_url: str):
         from .utils.db import SessionLocal
         from .services.downloader import fetch_transcript, download_video
         from .services.transcriber import transcribe
         from .services.clip_selector import select_best_clip
         from .services.trimmer import trim_and_crop
-        from .services.captioner import burn_captions
 
         db = SessionLocal()
         try:
@@ -97,43 +86,37 @@ try:
             if not job:
                 return
 
-            # 1. Try to get transcript first (tiny, never blocked)
+            # 1. Get transcript (fast)
             job.status = "fetching transcript"
             db.commit()
             srt = fetch_transcript(youtube_url)
 
             if srt:
                 words = parse_srt(srt)
-                # Fake metadata (heatmap not available)
                 metadata = {"duration": 0, "heatmap": None}
                 start, end = select_best_clip(None, metadata, words)
-                job.start_time = start
-                job.end_time = end
-
-                # 2. Download only that segment
-                job.status = "downloading clip"
-                db.commit()
-                video_path, _ = download_video(youtube_url, settings.DOWNLOAD_DIR,
-                                               start=start, end=end)
             else:
-                # Fallback: full download + transcribe (or use user upload)
-                # This triggers only if auto‑subs are disabled or missing.
+                # Fallback: full download + transcribe
                 job.status = "downloading full video"
                 db.commit()
                 video_path, metadata = download_video(youtube_url)
                 words = transcribe(video_path)
                 start, end = select_best_clip(video_path, metadata, words)
 
-            # 3. Trim & crop to 9:16
+            job.start_time = start
+            job.end_time = end
+
+            # 2. Download only the best segment
+            job.status = "downloading clip"
+            db.commit()
+            video_path, _ = download_video(youtube_url, settings.DOWNLOAD_DIR,
+                                           start=start, end=end)
+
+            # 3. Trim & crop to 9:16 – FINAL OUTPUT
             job.status = "trimming"
             db.commit()
             trimmed = trim_and_crop(video_path, start, end, settings.CLIP_DIR)
-
-            # 4. Burn captions (using the words we have)
-            job.status = "captioning"
-            db.commit()
-            final_clip = burn_captions(trimmed, words, settings.CLIP_DIR)
-            job.clip_path = str(final_clip)
+            job.clip_path = str(trimmed)
 
             job.status = "done"
             db.commit()
@@ -152,13 +135,12 @@ try:
         finally:
             db.close()
 
-    # ---------- PIPELINE FOR UPLOADED FILE (unchanged) ----------
+    # ---------- PIPELINE FOR UPLOADED FILE (no captions) ----------
     def run_pipeline_with_file(job_id: str, file_path: str):
         from .utils.db import SessionLocal
         from .services.transcriber import transcribe
         from .services.clip_selector import select_best_clip
         from .services.trimmer import trim_and_crop
-        from .services.captioner import burn_captions
 
         db = SessionLocal()
         try:
@@ -182,11 +164,7 @@ try:
             job.status = "trimming"
             db.commit()
             trimmed = trim_and_crop(video_path, start, end, settings.CLIP_DIR)
-
-            job.status = "captioning"
-            db.commit()
-            final_clip = burn_captions(trimmed, words, settings.CLIP_DIR)
-            job.clip_path = str(final_clip)
+            job.clip_path = str(trimmed)
 
             job.status = "done"
             db.commit()
