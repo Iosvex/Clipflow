@@ -3,46 +3,36 @@ import wave
 import json
 import subprocess
 import tempfile
-import requests
-import zipfile
 from pathlib import Path
 from typing import List, Dict, Optional
 from vosk import Model, KaldiRecognizer
 from ..config import settings
 
+# Small English model (40 MB) – downloaded once, cached permanently
 MODEL_DIR = os.path.join(settings.DOWNLOAD_DIR, "vosk-model-small-en-us-0.15")
 MODEL_URL = "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
 
 def _ensure_model():
+    """Download the Vosk model if not already present."""
     if not os.path.exists(MODEL_DIR):
-        print(f"Downloading Vosk model (40 MB) to {MODEL_DIR} ...", flush=True)
+        print(f"Downloading Vosk model to {MODEL_DIR} ...", flush=True)
         os.makedirs(settings.DOWNLOAD_DIR, exist_ok=True)
         zip_path = MODEL_DIR + ".zip"
-        resp = requests.get(MODEL_URL, stream=True, timeout=120)
-        resp.raise_for_status()
-        with open(zip_path, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=8192):
-                f.write(chunk)
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(settings.DOWNLOAD_DIR)
+        subprocess.run(["wget", "-O", zip_path, MODEL_URL], check=True)
+        subprocess.run(["unzip", "-q", zip_path, "-d", settings.DOWNLOAD_DIR], check=True)
         os.unlink(zip_path)
-        print("Model downloaded and extracted.", flush=True)
     return Model(MODEL_DIR)
 
 def transcribe(video_path: Path, language: Optional[str] = None) -> List[Dict]:
+    # Convert video to 16kHz mono WAV (Vosk requirement)
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         wav_path = tmp.name
     try:
-        # Convert video to 16kHz mono WAV and capture stderr
-        proc = subprocess.run([
-            "ffmpeg", "-i", str(video_path), "-vn",
+        subprocess.run([
+            "ffmpeg", "-y", "-i", str(video_path), "-vn",
             "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000",
             wav_path
-        ], capture_output=True, text=True)
-
-        if proc.returncode != 0:
-            # FFmpeg failed – show the actual error in the exception
-            raise RuntimeError(f"FFmpeg failed:\n{proc.stderr}")
+        ], check=True, capture_output=True)
 
         model = _ensure_model()
         wf = wave.open(wav_path, "rb")
@@ -55,25 +45,29 @@ def transcribe(video_path: Path, language: Optional[str] = None) -> List[Dict]:
             if len(data) == 0:
                 break
             if rec.AcceptWaveform(data):
-                res = json.loads(rec.Result())
-                for w in res.get("result", []):
-                    words_output.append({
-                        "word": w["word"],
-                        "start": w["start"],
-                        "end": w["end"],
-                        "score": w["conf"]
-                    })
-        res = json.loads(rec.FinalResult())
-        for w in res.get("result", []):
-            words_output.append({
-                "word": w["word"],
-                "start": w["start"],
-                "end": w["end"],
-                "score": w["conf"]
-            })
+                result = json.loads(rec.Result())
+                if "result" in result:
+                    for w in result["result"]:
+                        words_output.append({
+                            "word": w["word"],
+                            "start": w["start"],
+                            "end": w["end"],
+                            "score": w["conf"]
+                        })
+        # Final part
+        result = json.loads(rec.FinalResult())
+        if "result" in result:
+            for w in result["result"]:
+                words_output.append({
+                    "word": w["word"],
+                    "start": w["start"],
+                    "end": w["end"],
+                    "score": w["conf"]
+                })
         return words_output
     finally:
+        # Always remove the temporary WAV file
         try:
             os.unlink(wav_path)
-        except:
+        except OSError:
             pass
