@@ -35,6 +35,20 @@ try:
     def root():
         return {"status": "alive"}
 
+    # ---------- OPTIONAL TEST ENDPOINT (yt‑dlp) ----------
+    @app.get("/test-ytdlp")
+    def test_ytdlp():
+        try:
+            import yt_dlp
+            with yt_dlp.YoutubeDL() as ydl:
+                info = ydl.extract_info(
+                    "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                    download=False
+                )
+            return {"title": info["title"]}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
     # ---------- PIPELINE ----------
     def run_pipeline(job_id: str, youtube_url: str):
         from .utils.db import SessionLocal
