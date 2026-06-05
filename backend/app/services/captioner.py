@@ -1,16 +1,17 @@
-"""
-Generates a dynamic ASS subtitle file with word-by-word karaoke highlighting
-and burns it onto the video using FFmpeg.
-"""
-
-import ffmpeg
+import os
+import uuid
 from pathlib import Path
 from typing import List, Dict
-import uuid
-import os
+import ffmpeg
 from ..config import settings
 
-# Basic ASS style template
+# Point ffmpeg to the static binary
+FFMPEG_BINARY = os.path.join(os.path.dirname(__file__), '..', 'ffmpeg')
+FFPROBE_BINARY = os.path.join(os.path.dirname(__file__), '..', 'ffprobe')
+os.environ["FFMPEG_BINARY"] = FFMPEG_BINARY
+os.environ["FFPROBE_BINARY"] = FFPROBE_BINARY
+
+# ASS header unchanged (use your existing one)
 ASS_HEADER = """[Script Info]
 Title: ClipFlow Captions
 ScriptType: v4.00+
@@ -36,19 +37,12 @@ EMOJI_MAP = {
 }
 
 def generate_ass(words: List[Dict], duration: float) -> str:
-    """
-    Build ASS file content from word-level timestamps.
-    Uses karaoke effect: current word highlighted, rest white.
-    Inserts emojis on high-confidence exciting words.
-    """
     lines = [ASS_HEADER]
-
-    # Group words into lines (max 4 words per subtitle line, split on pauses)
+    # Group words into lines (max 4 per line, split on pauses)
     subtitle_groups = []
     current_group = []
     for w in words:
         current_group.append(w)
-        # Start a new line if pause > 0.3 seconds or 4 words reached
         if len(current_group) >= 4 or (w == words[-1]) or (
             current_group[-1]["end"] - current_group[-1]["start"] > 0.3 and len(current_group) > 2
         ):
@@ -63,19 +57,18 @@ def generate_ass(words: List[Dict], duration: float) -> str:
         start = group[0]["start"]
         end = group[-1]["end"]
 
-        # Build karaoke text: {\kf<duration_ms>}word{\kf0}
+        # Karaoke parts
         karaoke_parts = []
         for w in group:
-            dur_ms = int((w["end"] - w["start"]) * 1000) + 50  # slight padding
+            dur_ms = int((w["end"] - w["start"]) * 1000) + 50
             clean_word = w["word"].strip()
             karaoke_parts.append(f"{{\\kf{dur_ms}}}{clean_word}")
         karaoke_text = " ".join(karaoke_parts)
 
-        # Default style (white word, later highlight)
         line = f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},Default,,0,0,0,,{karaoke_text}"
         lines.append(line)
 
-        # Emoji insertions: if a word is exciting and confidence high, insert emoji near it
+        # Emoji insertions
         for w in group:
             if w.get("score", 0) > 0.85:
                 word_lower = w["word"].strip().lower().rstrip(",.!?")
@@ -85,26 +78,17 @@ def generate_ass(words: List[Dict], duration: float) -> str:
                     emoji_end = w["start"] + 2.0
                     emoji_line = f"Dialogue: 0,{_ass_time(emoji_start)},{_ass_time(emoji_end)},Emoji,,0,0,0,,{emoji}"
                     lines.append(emoji_line)
-
     return "\n".join(lines)
 
 def _ass_time(seconds: float) -> str:
-    """Convert float seconds to ASS time format: H:MM:SS.CC"""
     hours = int(seconds // 3600)
     mins = int((seconds % 3600) // 60)
     secs = int(seconds % 60)
     centiseconds = int((seconds * 100) % 100)
     return f"{hours}:{mins:02d}:{secs:02d}.{centiseconds:02d}"
 
-def burn_captions(
-    input_video: Path,
-    words: List[Dict],
-    output_dir: str = None,
-    font_path: str = None
-) -> Path:
-    """
-    Creates an ASS subtitle file, burns it onto the video, returns final clip path.
-    """
+def burn_captions(input_video: Path, words: List[Dict],
+                  output_dir: str = None, font_path: str = None) -> Path:
     if output_dir is None:
         output_dir = settings.CLIP_DIR
     os.makedirs(output_dir, exist_ok=True)
@@ -113,21 +97,20 @@ def burn_captions(
     ass_path = Path(output_dir) / f"subs_{job_id}.ass"
     output_video = Path(output_dir) / f"captioned_{job_id}.mp4"
 
-    # Get video duration via ffprobe
-    probe = ffmpeg.probe(str(input_video))
+    # Get duration
+    probe = ffmpeg.probe(str(input_video), cmd=FFPROBE_BINARY)
     duration = float(probe["format"]["duration"])
 
     ass_content = generate_ass(words, duration)
     with open(ass_path, "w", encoding="utf-8") as f:
         f.write(ass_content)
 
-    # Burn subtitles
     (
         ffmpeg
         .input(str(input_video))
         .filter("ass", filename=str(ass_path))
         .output(str(output_video), vcodec="libx264", acodec="aac", preset="fast", crf=22)
         .overwrite_output()
-        .run(quiet=True)
+        .run(cmd=FFMPEG_BINARY, quiet=True)
     )
     return output_video
