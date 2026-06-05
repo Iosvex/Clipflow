@@ -1,67 +1,69 @@
-import requests
-import time
+import os
+import wave
+import json
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import List, Dict, Optional
+from vosk import Model, KaldiRecognizer
 from ..config import settings
 
-# Try the primary first, then fallback to a mirror (same API, different DNS)
-HF_API_URLS = [
-    "https://api-inference.huggingface.co/models/openai/whisper-small",
-    "https://whisper.s4s.tech",  # community mirror (may not support word_timestamps exactly)
-]
+# Small English model (40 MB) – downloaded once, cached permanently
+MODEL_DIR = os.path.join(settings.DOWNLOAD_DIR, "vosk-model-small-en-us-0.15")
+MODEL_URL = "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
+
+def _ensure_model():
+    """Download the Vosk model if not already present."""
+    if not os.path.exists(MODEL_DIR):
+        print(f"Downloading Vosk model to {MODEL_DIR} ...", flush=True)
+        os.makedirs(settings.DOWNLOAD_DIR, exist_ok=True)
+        zip_path = MODEL_DIR + ".zip"
+        subprocess.run(["wget", "-O", zip_path, MODEL_URL], check=True)
+        subprocess.run(["unzip", "-q", zip_path, "-d", settings.DOWNLOAD_DIR], check=True)
+        os.unlink(zip_path)
+    return Model(MODEL_DIR)
 
 def transcribe(video_path: Path, language: Optional[str] = None) -> List[Dict]:
-    headers = {"Authorization": f"Bearer {settings.HF_API_TOKEN}"}
-    file_size = video_path.stat().st_size
+    # Convert video to 16kHz mono WAV (Vosk requirement)
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        wav_path = tmp.name
+    try:
+        subprocess.run([
+            "ffmpeg", "-i", str(video_path), "-vn",
+            "-acodec", "pcm_s16le", "-ac", "1", "-ar", "16000",
+            wav_path
+        ], check=True, capture_output=True)
 
-    # If file is larger than 25 MB, extract first 2 minutes of audio as low‑size mp3
-    if file_size > 25 * 1024 * 1024:
-        import ffmpeg
-        audio_path = video_path.with_suffix(".mp3")
-        (
-            ffmpeg
-            .input(str(video_path), ss=0, t=120)
-            .output(str(audio_path), acodec="libmp3lame", ac=1, ar="16000")
-            .overwrite_output()
-            .run(quiet=True)
-        )
-        with open(audio_path, "rb") as af:
-            audio_data = af.read()
-        audio_path.unlink(missing_ok=True)
-    else:
-        with open(video_path, "rb") as f:
-            audio_data = f.read()
+        model = _ensure_model()
+        wf = wave.open(wav_path, "rb")
+        rec = KaldiRecognizer(model, wf.getframerate())
+        rec.SetWords(True)
 
-    params = {"word_timestamps": "true"}
-    if language:
-        params["language"] = language
-
-    last_exception = None
-    for attempt in range(3):  # up to 3 retries
-        for api_url in HF_API_URLS:
-            try:
-                response = requests.post(api_url, headers=headers, data=audio_data,
-                                         params=params, timeout=30)
-                if response.status_code == 200:
-                    data = response.json()
-                    # Parse word timestamps (HF returns chunks)
-                    words_output = []
-                    for chunk in data.get("chunks", []):
-                        text = chunk["text"]
-                        timestamps = chunk.get("timestamp", (0, 0))
-                        start = timestamps[0] / 1000.0 if timestamps[0] else 0
-                        end = timestamps[1] / 1000.0 if timestamps[1] else 0
-                        for word in text.split():
-                            words_output.append({
-                                "word": word,
-                                "start": start,
-                                "end": end,
-                                "score": 0.9
-                            })
-                    return words_output
-                else:
-                    last_exception = Exception(f"HF API status {response.status_code}: {response.text}")
-            except Exception as e:
-                last_exception = e
-                time.sleep(2 ** attempt)   # wait 2, 4, 8 seconds before next retry
-    raise last_exception or RuntimeError("All transcription attempts failed")
+        words_output = []
+        while True:
+            data = wf.readframes(4000)
+            if len(data) == 0:
+                break
+            if rec.AcceptWaveform(data):
+                result = json.loads(rec.Result())
+                if "result" in result:
+                    for w in result["result"]:
+                        words_output.append({
+                            "word": w["word"],
+                            "start": w["start"],
+                            "end": w["end"],
+                            "score": w["conf"]
+                        })
+        # Final part
+        result = json.loads(rec.FinalResult())
+        if "result" in result:
+            for w in result["result"]:
+                words_output.append({
+                    "word": w["word"],
+                    "start": w["start"],
+                    "end": w["end"],
+                    "score": w["conf"]
+                })
+        return words_output
+    finally:
+        os.unlink(wav_path)
